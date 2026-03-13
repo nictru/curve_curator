@@ -428,9 +428,15 @@ def add_logistic_model(df, ratio_cols, x_data, f_statistic_params, fit_params):
     return df
 
 
-def run_pipeline(df, config, decoy_mode=False):
+def _preprocess(df, config, decoy_mode=False):
     """
-    main function. Do the analysis based on the config file. Parallelize analysis with n cores.
+    Preprocessing stage: NaN filtering, imputation, normalisation, ratio calculation,
+    dose sorting, and optional interpolation setup.
+
+    Returns the preprocessed DataFrame and a tuple
+    ``(drug_log_concs_sorted, cols_ratio_sorted, fit_params, f_statistic_params)``.
+    This factoring allows ``api.py`` to substitute the fitting step with an
+    alternative backend (e.g. PyTorch) without duplicating preprocessing logic.
     """
     # Load parameters from toml file
     experiments = np.array(config['Experiment']['experiments'])
@@ -529,6 +535,15 @@ def run_pipeline(df, config, decoy_mode=False):
         fit_params['x_interpolated'] = build_interpolation_points(drug_log_concs_sorted)
         ui.message(' * Fit will use interpolation X values:', end='\n')
         ui.message('   {}'.format(list(map(lambda v: round(float(v), 2), fit_params['x_interpolated']))))
+
+    return df, (drug_log_concs_sorted, cols_ratio_sorted, fit_params, f_statistic_params)
+
+
+def run_pipeline(df, config, decoy_mode=False):
+    """
+    main function. Do the analysis based on the config file. Parallelize analysis with n cores.
+    """
+    df, (drug_log_concs_sorted, cols_ratio_sorted, fit_params, f_statistic_params) = _preprocess(df, config, decoy_mode=decoy_mode)
 
     # Fit the logistic model using multiple cores and optional processing parameters
     n_cores = config['Processing']['available_cores']
