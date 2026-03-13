@@ -223,30 +223,38 @@ def batch_fit_4pl(df: pd.DataFrame, config: dict, *, device: str | torch.device 
     """
     # ------------------------------------------------------------------
     # Resolve device (fall back to CPU if CUDA/MPS not available)
+    # "auto" selects CUDA > MPS > CPU in priority order.
     # ------------------------------------------------------------------
-    try:
-        dev = torch.device(device)
-        if dev.type == "cuda" and not torch.cuda.is_available():
-            import warnings
-            warnings.warn("CUDA requested but not available — falling back to CPU.", RuntimeWarning, stacklevel=2)
+    import warnings
+
+    if device == "auto":
+        if torch.cuda.is_available():
+            dev = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            dev = torch.device("mps")
+        else:
             dev = torch.device("cpu")
-        elif dev.type == "cuda" and torch.cuda.is_available():
-            n_gpus = torch.cuda.device_count()
-            gpu_idx = dev.index if dev.index is not None else 0
-            if gpu_idx >= n_gpus:
-                import warnings
-                warnings.warn(
-                    f"CUDA device {device} out of range (have {n_gpus} GPU(s)) — falling back to CPU.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+    else:
+        try:
+            dev = torch.device(device)
+            if dev.type == "cuda" and not torch.cuda.is_available():
+                warnings.warn("CUDA requested but not available — falling back to CPU.", RuntimeWarning, stacklevel=2)
                 dev = torch.device("cpu")
-        elif dev.type == "mps" and not torch.backends.mps.is_available():
-            import warnings
-            warnings.warn("MPS requested but not available — falling back to CPU.", RuntimeWarning, stacklevel=2)
+            elif dev.type == "cuda" and torch.cuda.is_available():
+                n_gpus = torch.cuda.device_count()
+                gpu_idx = dev.index if dev.index is not None else 0
+                if gpu_idx >= n_gpus:
+                    warnings.warn(
+                        f"CUDA device {device} out of range (have {n_gpus} GPU(s)) — falling back to CPU.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    dev = torch.device("cpu")
+            elif dev.type == "mps" and not torch.backends.mps.is_available():
+                warnings.warn("MPS requested but not available — falling back to CPU.", RuntimeWarning, stacklevel=2)
+                dev = torch.device("cpu")
+        except Exception:
             dev = torch.device("cpu")
-    except Exception:
-        dev = torch.device("cpu")
 
     dtype = torch.float64
 
