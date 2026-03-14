@@ -193,7 +193,13 @@ def _all_initial_guesses(x_cpu: np.ndarray, y: Tensor, pec50_lo: float, pec50_hi
 # ---------------------------------------------------------------------------
 
 
-def batch_fit_4pl(df: pd.DataFrame, config: dict, *, device: str | torch.device = "cpu") -> pd.DataFrame:
+def batch_fit_4pl(
+    df: pd.DataFrame,
+    config: dict,
+    *,
+    device: str | torch.device = "cpu",
+    gpu_chunk_size: int = 50_000,
+) -> pd.DataFrame:
     """Fit 4PL curves to all rows in *df* using batched LBFGS on *device*.
 
     *df* must already be preprocessed (ratio columns computed, doses sorted
@@ -209,6 +215,12 @@ def batch_fit_4pl(df: pd.DataFrame, config: dict, *, device: str | torch.device 
         PyTorch device string or object, e.g. ``"cpu"``, ``"cuda"``,
         ``"cuda:0"``, ``"mps"``.  Falls back to CPU if the requested device
         is unavailable.
+    gpu_chunk_size:
+        Maximum number of curves per GPU sub-batch.  When ``B > gpu_chunk_size``
+        on a non-CPU device, the DataFrame is split into sequential sub-batches
+        of at most *gpu_chunk_size* rows, each processed independently, and the
+        results are concatenated.  This bounds peak VRAM regardless of group
+        size.  Has no effect on CPU.  Default: 50,000.
 
     Returns
     -------
@@ -255,6 +267,31 @@ def batch_fit_4pl(df: pd.DataFrame, config: dict, *, device: str | torch.device 
                 dev = torch.device("cpu")
         except Exception:
             dev = torch.device("cpu")
+
+    B = len(df)
+
+    # GPU sub-batching: split oversized groups into sequential chunks so that
+    # peak VRAM per chunk stays bounded regardless of group size.
+    if dev.type != "cpu" and B > gpu_chunk_size:
+        chunks = [
+            df.iloc[i : i + gpu_chunk_size]
+            for i in range(0, B, gpu_chunk_size)
+        ]
+        return pd.concat(
+            [_batch_fit_4pl_inner(chunk, config, dev=dev) for chunk in chunks]
+        )
+
+    return _batch_fit_4pl_inner(df, config, dev=dev)
+
+
+def _batch_fit_4pl_inner(df: pd.DataFrame, config: dict, *, dev: torch.device) -> pd.DataFrame:
+    """Core 4PL fitting logic for a single chunk on a resolved device.
+
+    Called by ``batch_fit_4pl`` — either directly (small batch) or once per
+    sub-batch (large GPU group).  VRAM is explicitly freed at the end of each
+    call so sequential sub-batches do not accumulate GPU memory.
+    """
+    import gc
 
     dtype = torch.float64
 
@@ -349,6 +386,7 @@ def batch_fit_4pl(df: pd.DataFrame, config: dict, *, device: str | torch.device 
     optimizer_ms = torch.optim.LBFGS(
         [pec50_ms, slope_ms, front_ms, back_ms],
         max_iter=_MAX_ITER,
+        history_size=10,  # reduced from default 100 to limit VRAM (each step: 2 × history × 4 × BN × 8 B)
         tolerance_grad=_TOLERANCE_GRAD,
         tolerance_change=_TOLERANCE_CHANGE,
         line_search_fn=_LINE_SEARCH_FN,
@@ -440,9 +478,7 @@ def batch_fit_4pl(df: pd.DataFrame, config: dict, *, device: str | torch.device 
         f_stat = (m0_sse - m1_sse_s) / m1_sse_s * (n_int / n_params)
         f_stat = f_stat.clamp(min=0.0)
 
-    # Move to CPU numpy, then free the device allocator cache so VRAM is
-    # returned to the driver after each batch (important when many groups
-    # are processed sequentially on the same GPU).
+    # Move all results to CPU numpy arrays before releasing device tensors.
     def _np(t: Tensor) -> np.ndarray:
         return t.detach().cpu().numpy()
 
@@ -459,7 +495,10 @@ def batch_fit_4pl(df: pd.DataFrame, config: dict, *, device: str | torch.device 
     f_stat_np = _np(f_stat)
     n_valid_np = _np(n_valid).astype(int)
 
-    # Release device tensors and flush allocator cache
+    # Release device tensors and flush allocator cache.
+    # LBFGS forms internal reference cycles; gc.collect() must be called
+    # explicitly before empty_cache() to fully return VRAM to the driver.
+    del optimizer_ms, closure_ms
     del (
         y_obs, nan_mask, x, y_ctrl, x_full, y_full_obs, nan_mask_full,
         pec50_all, front_all, back_all,
@@ -473,6 +512,7 @@ def batch_fit_4pl(df: pd.DataFrame, config: dict, *, device: str | torch.device 
         rmse, r2, null_rmse, null_intercept,
         y_at_max, y_at_min, fold_change, auc, f_stat,
     )
+    gc.collect()
     if dev.type == "cuda":
         torch.cuda.synchronize(dev)
         torch.cuda.empty_cache()

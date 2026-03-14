@@ -11,7 +11,13 @@ import pandas as pd
 from . import data_parser, quality_control, quantification, thresholding, toml_parser, torch_fitting
 
 
-def run_pipeline_api(config: dict, *, mad: bool = False, device: str = "cpu") -> pd.DataFrame:
+def run_pipeline_api(
+    config: dict,
+    *,
+    mad: bool = False,
+    device: str = "cpu",
+    gpu_chunk_size: int = 50_000,
+) -> pd.DataFrame:
     """Run the CurveCurator pipeline in-process from a pre-built config dict.
 
     Uses a batched PyTorch LBFGS fitting backend that runs on CPU or GPU.
@@ -44,6 +50,9 @@ def run_pipeline_api(config: dict, *, mad: bool = False, device: str = "cpu") ->
         PyTorch device string for the fitting backend, e.g. ``"cpu"``,
         ``"cuda"``, ``"cuda:0"``, ``"mps"``.  Falls back to CPU automatically
         if the requested device is unavailable.
+    gpu_chunk_size:
+        Maximum number of curves per GPU sub-batch.  Passed directly to
+        ``batch_fit_4pl``.  See ``torch_fitting.batch_fit_4pl`` for details.
 
     Returns
     -------
@@ -55,7 +64,7 @@ def run_pipeline_api(config: dict, *, mad: bool = False, device: str = "cpu") ->
     config = toml_parser.set_default_values(config)
     data = data_parser.load(config)
     data, _preprocess_result = quantification._preprocess(data, config)
-    data = torch_fitting.batch_fit_4pl(data, config, device=device)
+    data = torch_fitting.batch_fit_4pl(data, config, device=device, gpu_chunk_size=gpu_chunk_size)
     data = thresholding.apply_significance_thresholds(data, config=config)
     if mad:
         quality_control.mad_analysis(data, config=config)
