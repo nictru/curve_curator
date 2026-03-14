@@ -4,8 +4,6 @@
 # Florian P. Bayer / drevalpy - 2025
 #
 
-import contextlib
-import io
 import os
 
 import pandas as pd
@@ -28,8 +26,9 @@ def run_pipeline_api(config: dict, *, mad: bool = False, device: str = "cpu") ->
     2. A ``'__file__'`` key must be present:
        ``config['__file__'] = {'Path': '/abs/path/to/config.toml'}``
 
-    stdout and stderr from CurveCurator's internal modules are suppressed so
-    that they do not interleave with the caller's progress display.
+    CurveCurator's internal print statements are routed through a NullHandler
+    logger (configured in ``user_interface.py``) so no output reaches
+    sys.stdout/stderr from worker threads.
 
     Parameters
     ----------
@@ -51,22 +50,13 @@ def run_pipeline_api(config: dict, *, mad: bool = False, device: str = "cpu") ->
     pd.DataFrame
         Fitted curves table in CurveCurator output format.
     """
-    import warnings  # noqa: PLC0415
-
+    # Suppress tqdm progress bars that some quantification internals emit
+    os.environ.setdefault("TQDM_DISABLE", "1")
     config = toml_parser.set_default_values(config)
-    sink = io.StringIO()
-    with (
-        contextlib.redirect_stdout(sink),
-        contextlib.redirect_stderr(sink),
-        warnings.catch_warnings(),
-    ):
-        warnings.simplefilter("ignore")
-        # Suppress tqdm progress bars that some quantification internals emit
-        os.environ.setdefault("TQDM_DISABLE", "1")
-        data = data_parser.load(config)
-        data, _preprocess_result = quantification._preprocess(data, config)
-        data = torch_fitting.batch_fit_4pl(data, config, device=device)
-        data = thresholding.apply_significance_thresholds(data, config=config)
-        if mad:
-            quality_control.mad_analysis(data, config=config)
+    data = data_parser.load(config)
+    data, _preprocess_result = quantification._preprocess(data, config)
+    data = torch_fitting.batch_fit_4pl(data, config, device=device)
+    data = thresholding.apply_significance_thresholds(data, config=config)
+    if mad:
+        quality_control.mad_analysis(data, config=config)
     return data

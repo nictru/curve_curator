@@ -10,7 +10,14 @@ import logging
 import time
 from pathlib import Path
 os.system("")
-LOGGER = None
+
+# Default to a NullHandler so message()/warning()/error() always go through
+# the logger rather than calling print() directly.  This prevents any
+# CurveCurator output from reaching sys.stdout/stderr while the library is
+# used in-process alongside a progress display (e.g. rich) in the caller.
+_null_logger = logging.getLogger("curve_curator")
+_null_logger.addHandler(logging.NullHandler())
+LOGGER: logging.Logger = _null_logger
 
 
 # ANSI escape sequences for Terminal Text Formatting.
