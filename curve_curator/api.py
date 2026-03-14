@@ -28,7 +28,8 @@ def run_pipeline_api(config: dict, *, mad: bool = False, device: str = "cpu") ->
     2. A ``'__file__'`` key must be present:
        ``config['__file__'] = {'Path': '/abs/path/to/config.toml'}``
 
-    stdout from CurveCurator's internal ``user_interface`` module is suppressed.
+    stdout and stderr from CurveCurator's internal modules are suppressed so
+    that they do not interleave with the caller's progress display.
 
     Parameters
     ----------
@@ -50,8 +51,16 @@ def run_pipeline_api(config: dict, *, mad: bool = False, device: str = "cpu") ->
     pd.DataFrame
         Fitted curves table in CurveCurator output format.
     """
+    import warnings  # noqa: PLC0415
+
     config = toml_parser.set_default_values(config)
-    with contextlib.redirect_stdout(io.StringIO()):
+    sink = io.StringIO()
+    with (
+        contextlib.redirect_stdout(sink),
+        contextlib.redirect_stderr(sink),
+        warnings.catch_warnings(),
+    ):
+        warnings.simplefilter("ignore")
         # Suppress tqdm progress bars that some quantification internals emit
         os.environ.setdefault("TQDM_DISABLE", "1")
         data = data_parser.load(config)
