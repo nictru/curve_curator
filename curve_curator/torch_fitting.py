@@ -440,7 +440,9 @@ def batch_fit_4pl(df: pd.DataFrame, config: dict, *, device: str | torch.device 
         f_stat = (m0_sse - m1_sse_s) / m1_sse_s * (n_int / n_params)
         f_stat = f_stat.clamp(min=0.0)
 
-    # Move to CPU numpy
+    # Move to CPU numpy, then free the device allocator cache so VRAM is
+    # returned to the driver after each batch (important when many groups
+    # are processed sequentially on the same GPU).
     def _np(t: Tensor) -> np.ndarray:
         return t.detach().cpu().numpy()
 
@@ -456,6 +458,26 @@ def batch_fit_4pl(df: pd.DataFrame, config: dict, *, device: str | torch.device 
     null_rmse_np = _np(null_rmse)
     f_stat_np = _np(f_stat)
     n_valid_np = _np(n_valid).astype(int)
+
+    # Release device tensors and flush allocator cache
+    del (
+        y_obs, nan_mask, x, y_ctrl, x_full, y_full_obs, nan_mask_full,
+        pec50_all, front_all, back_all,
+        pec50_starts, front_starts, back_starts, slope_starts,
+        y_obs_exp, nan_mask_exp, x_exp,
+        pec50_ms, slope_ms, front_ms, back_ms,
+        y_pred_all, sse_all, sse_mat, best_start, idx,
+        pec50_f, slope_f, front_f, back_f,
+        y_pred_full, n_valid, m1_resid, m1_sse,
+        y_for_mean, y_mean_null, m0_sse,
+        rmse, r2, null_rmse, null_intercept,
+        y_at_max, y_at_min, fold_change, auc, f_stat,
+    )
+    if dev.type == "cuda":
+        torch.cuda.synchronize(dev)
+        torch.cuda.empty_cache()
+    elif dev.type == "mps":
+        torch.mps.empty_cache()
 
     # ------------------------------------------------------------------
     # p-values via scipy (CPU, vectorised)
