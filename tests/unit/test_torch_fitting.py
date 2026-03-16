@@ -2,7 +2,11 @@
 Numerical equivalence tests for the PyTorch 4PL fitting backend.
 
 Uses the same synthetic data as ``TestFitting`` in ``test_model_logistic.py``
-to verify that the PyTorch LBFGS backend recovers known ground-truth parameters.
+to verify that the PyTorch Adam backend recovers known ground-truth parameters.
+
+Includes regression tests (``TestBatchFit4plRegression``) that explicitly encode
+the B ≥ 5 boundary-collapse bug that was present in the original LBFGS
+implementation.
 """
 
 import numpy as np
@@ -229,3 +233,60 @@ class TestBatchFit4pl:
             warnings.simplefilter("ignore")
             result = batch_fit_4pl(df_single, config, device="cuda:99")
         assert "pEC50" in result.columns
+
+
+# ---------------------------------------------------------------------------
+# Regression tests — encode the B ≥ 5 LBFGS boundary-collapse bug
+# ---------------------------------------------------------------------------
+
+
+class TestBatchFit4plRegression:
+    """Regression suite: LBFGS mega-batch collapsed pEC50 to pec50_hi for B ≥ 5.
+
+    These tests use the same synthetic data as TestBatchFit4pl but with larger
+    batch sizes that reliably triggered the bug.  They will fail immediately
+    if the vectorised Adam optimizer is ever reverted to LBFGS without fixing
+    the root-cause cross-curve Hessian contamination.
+    """
+
+    @pytest.fixture()
+    def config(self) -> dict:
+        return _make_config(DOSES_UM)
+
+    def test_batch_b5_no_boundary_collapse(self, config: dict) -> None:
+        """Regression: LBFGS mega-batch collapsed all pEC50 to pec50_hi for B>=5."""
+        y_batch = np.tile(_Y_NOISELESS, (5, 1))
+        df = _make_df(y_batch, config)
+        result = batch_fit_4pl(df, config, device="cpu")
+        # pec50_hi is the upper clamp bound used internally: -log10(min_dose) + 2
+        pec50_hi = -np.log10(DOSES_UM * DOSE_SCALE).min() + 2.0
+        assert not (result["pEC50"] >= pec50_hi - 0.01).any(), (
+            "pEC50 collapsed to upper boundary — batch optimizer bug reintroduced"
+        )
+        assert (abs(result["pEC50"] - _TRUE_PARAMS["pec50"]) < 0.2).all()
+
+    def test_batch_b126_convergence(self, config: dict) -> None:
+        """B=126 (size of the real CTRPv2 bortezomib group) must not collapse."""
+        rng = np.random.default_rng(0)
+        true_pec50 = rng.uniform(5.5, 8.5, 126)
+        # Generate 126 noiseless 4PL curves with varying pEC50
+        y_batch = np.stack([
+            (0.95 - 0.05) / (1 + 10 ** (1.5 * (_X + p))) + 0.05
+            for p in true_pec50
+        ])
+        df = _make_df(y_batch, config)
+        result = batch_fit_4pl(df, config, device="cpu")
+        pec50_hi = -np.log10(DOSES_UM * DOSE_SCALE).min() + 2.0
+        boundary_frac = (result["pEC50"] >= pec50_hi - 0.01).mean()
+        assert boundary_frac < 0.02, (
+            f"{boundary_frac * 100:.1f}% of B=126 curves collapsed to boundary"
+        )
+
+    def test_p_value_significant_for_clear_sigmoid_batch(self, config: dict) -> None:
+        """Clear sigmoid curves in a batch of 10 must all yield p < 0.01."""
+        y_clear = (0.95 - 0.01) / (1 + 10 ** (2.0 * (_X + 7.0))) + 0.01
+        df = _make_df(np.tile(y_clear, (10, 1)), config)
+        result = batch_fit_4pl(df, config, device="cpu")
+        assert (result["Curve P_Value"] < 0.01).all(), (
+            "Some clear sigmoid curves did not yield significant p-values in batch"
+        )

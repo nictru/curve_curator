@@ -2,7 +2,7 @@
 Batched 4-parameter log-logistic (4PL) curve fitting using PyTorch.
 
 Replaces the per-row scipy-based fitting in quantification.run_pipeline with a
-single batched LBFGS optimisation pass that runs transparently on CPU or GPU.
+vectorised Adam optimisation pass that runs transparently on CPU or GPU.
 
 The public entry point is ``batch_fit_4pl(df, config, device)``, which accepts
 the preprocessed DataFrame produced by ``quantification._preprocess`` and
@@ -13,6 +13,21 @@ Mathematical conventions follow models.py exactly:
   y = (front - back) / (1 + 10^(slope * (x + pec50))) + back
 
 where x is log10(concentration) and pec50 = -log10(EC50).
+
+Optimizer choice — Adam instead of L-BFGS
+------------------------------------------
+L-BFGS uses a *shared* Hessian history (s/y pairs) for the entire flattened
+parameter vector [pec50_0, ..., pec50_{BN}, slope_0, ...].  When B curves are
+batched, the aggregate curvature information from all curves is conflated.  The
+strong Wolfe line search then picks a single step size that satisfies the Wolfe
+conditions for the aggregate loss but overshoots individual curves, causing most
+pEC50 values to collapse to the upper boundary.  Empirically this failure mode
+activates at B ≥ 5.
+
+Adam maintains *per-parameter independent* first/second moment estimates
+(m_i, v_i).  The effective step for parameter θ_j (belonging to curve j)
+depends only on the gradient history of θ_j — there is no cross-curve
+curvature contamination, even when all BN parameters share one flat tensor.
 """
 
 from __future__ import annotations
@@ -41,11 +56,10 @@ _Y_LO = 1e-4
 _Y_HI = 1e6
 _LOG10 = math.log(10.0)
 
-# LBFGS hyper-parameters
-_MAX_ITER = 200
-_TOLERANCE_GRAD = 1e-7
-_TOLERANCE_CHANGE = 1e-9
-_LINE_SEARCH_FN = "strong_wolfe"
+# Adam hyper-parameters
+_ADAM_ITERATIONS = 1000
+_ADAM_LR = 0.1
+_ADAM_ETA_MIN = 1e-5
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +214,7 @@ def batch_fit_4pl(
     device: str | torch.device = "cpu",
     gpu_chunk_size: int = 50_000,
 ) -> pd.DataFrame:
-    """Fit 4PL curves to all rows in *df* using batched LBFGS on *device*.
+    """Fit 4PL curves to all rows in *df* using batched Adam on *device*.
 
     *df* must already be preprocessed (ratio columns computed, doses sorted
     low-to-high).  This matches the output of ``quantification._preprocess``.
@@ -349,7 +363,7 @@ def _batch_fit_4pl_inner(df: pd.DataFrame, config: dict, *, dev: torch.device) -
     # Multi-start: generate ALL initial guesses × slope seeds (mirrors
     # extensively_fit_guesses_ols from models.py).
     # We expand the batch to (B × n_starts) where n_starts = n_cand × n_slopes,
-    # run one vectorised LBFGS pass, then reduce by selecting the start with the
+    # run one vectorised Adam pass, then reduce by selecting the start with the
     # lowest final OLS cost per original curve.
     # ------------------------------------------------------------------
     # Slope seeds (same as extensively_fit_guesses_ols default)
@@ -369,7 +383,7 @@ def _batch_fit_4pl_inner(df: pd.DataFrame, config: dict, *, dev: torch.device) -
 
     n_starts = pec50_starts.shape[0]  # n_cand × n_slopes
 
-    # Flatten to a single mega-batch of size (B × n_starts) for one LBFGS pass
+    # Flatten to a single mega-batch of size (B × n_starts) for one Adam pass
     # Layout: [curve_0_start_0, curve_1_start_0, ..., curve_B_start_0, curve_0_start_1, ...]
     # We index as [start_i * B + curve_j]
     BN = B * n_starts  # total parameter vectors
@@ -380,46 +394,61 @@ def _batch_fit_4pl_inner(df: pd.DataFrame, config: dict, *, dev: torch.device) -
     nan_mask_exp = nan_mask.repeat(n_starts, 1)  # (BN, D)
     x_exp = x[None, :].expand(BN, D)             # (BN, D)
 
+    # Full data (dose + synthetic control) for best-start selection.
+    # The synthetic control (y=1.0 at x_ctrl) is included so that degenerate
+    # solutions with large front values that fit the dose data but extrapolate
+    # poorly to the control point are penalised during start selection.
+    y_full_exp = y_full_obs.repeat(n_starts, 1)           # (BN, D+1)
+    nan_mask_full_exp = nan_mask_full.repeat(n_starts, 1)  # (BN, D+1)
+    x_full_exp = x_full[None, :].expand(BN, D + 1)        # (BN, D+1)
+
     pec50_ms = pec50_starts.reshape(-1).clone().requires_grad_(True)  # (BN,)
     slope_ms = slope_starts.reshape(-1).clone().requires_grad_(True)
     front_ms = front_starts.reshape(-1).clone().requires_grad_(True)
     back_ms = back_starts.reshape(-1).clone().requires_grad_(True)
 
-    optimizer_ms = torch.optim.LBFGS(
-        [pec50_ms, slope_ms, front_ms, back_ms],
-        max_iter=_MAX_ITER,
-        history_size=10,  # reduced from default 100 to limit VRAM (each step: 2 × history × 4 × BN × 8 B)
-        tolerance_grad=_TOLERANCE_GRAD,
-        tolerance_change=_TOLERANCE_CHANGE,
-        line_search_fn=_LINE_SEARCH_FN,
+    # Adam with cosine LR annealing.
+    #
+    # L-BFGS cannot be used here: it maintains a *shared* Hessian history for
+    # the entire flat parameter vector, which conflates curvature from all B
+    # curves and causes the line search to collapse pEC50 values to the upper
+    # boundary for B ≥ 5 (empirically confirmed).  Adam's per-parameter m/v
+    # estimates are fully independent, so there is no cross-curve contamination.
+    optimizer_ms = torch.optim.Adam(
+        [pec50_ms, slope_ms, front_ms, back_ms], lr=_ADAM_LR
     )
-
-    def closure_ms() -> Tensor:
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_ms, T_max=_ADAM_ITERATIONS, eta_min=_ADAM_ETA_MIN
+    )
+    for _ in range(_ADAM_ITERATIONS):
         optimizer_ms.zero_grad()
         y_pred = _sigmoid_4pl(x_exp, pec50_ms, slope_ms, front_ms, back_ms)
         residuals = (y_pred - y_obs_exp) * nan_mask_exp
         loss = (residuals ** 2).sum()
         loss.backward()
-        return loss
-
-    optimizer_ms.step(closure_ms)
-
-    # Project parameters back into bounds
-    with torch.no_grad():
-        pec50_ms.data.clamp_(pec50_lo, pec50_hi)
-        slope_ms.data.clamp_(_SLOPE_LO, _SLOPE_HI)
-        front_ms.data.clamp_(_Y_LO, _Y_HI)
-        back_ms.data.clamp_(_Y_LO, _Y_HI)
+        optimizer_ms.step()
+        scheduler.step()
+        # Project parameters back into bounds after each step to prevent the
+        # optimiser from wandering into regions where the sigmoid is numerically
+        # degenerate (e.g. pEC50 >> pec50_hi → flat curve).
+        with torch.no_grad():
+            pec50_ms.data.clamp_(pec50_lo, pec50_hi)
+            slope_ms.data.clamp_(_SLOPE_LO, _SLOPE_HI)
+            front_ms.data.clamp_(_Y_LO, _Y_HI)
+            back_ms.data.clamp_(_Y_LO, _Y_HI)
 
     # ------------------------------------------------------------------
-    # Select best start per original curve by final OLS cost
+    # Select best start per original curve by final OLS cost over full data
+    # (dose points + synthetic control).  Using full-data SSE prevents
+    # degenerate solutions that fit doses well but extrapolate poorly to the
+    # control (e.g. front >> 1) from being selected as the best start.
     # ------------------------------------------------------------------
     with torch.no_grad():
-        y_pred_all = _sigmoid_4pl(x_exp, pec50_ms, slope_ms, front_ms, back_ms)
-        sse_all = ((y_pred_all - y_obs_exp) ** 2 * nan_mask_exp).sum(dim=1)  # (BN,)
+        y_pred_full_all = _sigmoid_4pl(x_full_exp, pec50_ms, slope_ms, front_ms, back_ms)
+        sse_full_all = ((y_pred_full_all - y_full_exp) ** 2 * nan_mask_full_exp).sum(dim=1)  # (BN,)
         # Reshape to (n_starts, B) and argmin over starts
-        sse_mat = sse_all.reshape(n_starts, B)    # (n_starts, B)
-        best_start = sse_mat.argmin(dim=0)        # (B,) indices in [0, n_starts)
+        sse_mat = sse_full_all.reshape(n_starts, B)  # (n_starts, B)
+        best_start = sse_mat.argmin(dim=0)            # (B,) indices in [0, n_starts)
 
         # Gather best parameters per curve
         idx = (best_start * B + torch.arange(B, device=dev))  # flat indices
@@ -498,16 +527,15 @@ def _batch_fit_4pl_inner(df: pd.DataFrame, config: dict, *, dev: torch.device) -
     n_valid_np = _np(n_valid).astype(int)
 
     # Release device tensors and flush allocator cache.
-    # LBFGS forms internal reference cycles; gc.collect() must be called
-    # explicitly before empty_cache() to fully return VRAM to the driver.
-    del optimizer_ms, closure_ms
+    del optimizer_ms, scheduler
     del (
         y_obs, nan_mask, x, y_ctrl, x_full, y_full_obs, nan_mask_full,
         pec50_all, front_all, back_all,
         pec50_starts, front_starts, back_starts, slope_starts,
         y_obs_exp, nan_mask_exp, x_exp,
+        y_full_exp, nan_mask_full_exp, x_full_exp,
         pec50_ms, slope_ms, front_ms, back_ms,
-        y_pred_all, sse_all, sse_mat, best_start, idx,
+        y_pred_full_all, sse_full_all, sse_mat, best_start, idx,
         pec50_f, slope_f, front_f, back_f,
         y_pred_full, n_valid, m1_resid, m1_sse,
         y_for_mean, y_mean_null, m0_sse,
@@ -555,7 +583,7 @@ def _batch_fit_4pl_inner(df: pd.DataFrame, config: dict, *, dev: torch.device) -
             dfd_i = f_stat_params.get("dfd", dfd_i)
             p_values[i] = stats.f.sf(float(f_stat_np[i]), dfn=dfn_i, dfd=dfd_i, scale=scale, loc=loc)
 
-    # Parameter errors — not available analytically from LBFGS, set to NaN
+    # Parameter errors — not available analytically from first-order optimizers, set to NaN
     # (matches the case when the covariance matrix cannot be computed)
     pec50_err = np.full(B, np.nan)
     slope_err = np.full(B, np.nan)
