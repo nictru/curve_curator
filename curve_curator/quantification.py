@@ -128,11 +128,13 @@ def normalize_values(df, raw_cols, norm_cols, ref_col=None):
     ref_mask = df[ref_col] if ref_col else df.index
     ref_medians = np.log2(df.loc[ref_mask, raw_cols].replace(0, np.nan)).median()
     normalization_factors = ref_medians.mean() - ref_medians
-    df[norm_cols] = 2 ** (np.log2(df[raw_cols].replace(0, np.nan)) + normalization_factors)
-    df[norm_cols] = df[norm_cols].replace([np.nan, -np.inf, np.inf], 0)
+    norm_values = 2 ** (np.log2(df[raw_cols].replace(0, np.nan)) + normalization_factors)
+    norm_values = norm_values.replace([np.nan, -np.inf, np.inf], 0)
     # Conserve the missing values from raw_cols
-    nan_mask = df[raw_cols].isna().copy().rename(columns=dict(zip(raw_cols, norm_cols)))
-    df[nan_mask] = np.nan
+    nan_mask = df[raw_cols].isna()
+    norm_values[nan_mask.values] = np.nan
+    norm_values.columns = norm_cols
+    df = pd.concat([df, norm_values], axis=1)
     return df, normalization_factors
 
 
@@ -158,7 +160,9 @@ def add_ratios(df, cols, ratio_cols, ref_cols):
     df : pd.DataFrame
         The result data frame with the added ratio_cols.
     """
-    df[ratio_cols] = df[cols].div(df[ref_cols].mean(axis=1), axis=0).replace([np.inf], np.nan)
+    ratios = df[cols].div(df[ref_cols].mean(axis=1), axis=0).replace([np.inf], np.nan)
+    ratios.columns = ratio_cols
+    df = pd.concat([df, ratios], axis=1)
     return df
 
 
