@@ -270,9 +270,11 @@ def batch_fit_4pl(
 
     B = len(df)
 
-    # GPU sub-batching: split oversized groups into sequential chunks so that
-    # peak VRAM per chunk stays bounded regardless of group size.
-    if dev.type != "cpu" and B > gpu_chunk_size:
+    # Sub-batching: split oversized groups into sequential chunks so that
+    # peak memory per chunk stays bounded regardless of group size.
+    # Applied on both GPU (to bound VRAM) and CPU (to avoid single huge
+    # tensor allocations that can crash the process).
+    if B > gpu_chunk_size:
         chunks = [
             df.iloc[i : i + gpu_chunk_size]
             for i in range(0, B, gpu_chunk_size)
