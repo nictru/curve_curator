@@ -1,3 +1,6 @@
+v0.7.0
+- Relax Poetry dependency version ranges and add Python 3.14 support
+
 v0.6.0
 - Improve the dashboard (#30, #32, #36, #41)
 - Improve UI with toml parsing, automatic issue detection, and better batch file logic (#44)
