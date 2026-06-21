@@ -262,7 +262,7 @@ def check_toml_params(config):
         keys = ['type']
         check_for_correct_values('Curve Fit', config, keys, requirement=lambda v: v in {'OLS', 'MLE'})
         keys = ['speed']
-        check_for_correct_values('Curve Fit', config, keys, requirement=lambda v: v in {'fast', 'standard', 'exhaustive', 'basinhopping'})
+        check_for_correct_values('Curve Fit', config, keys, requirement=lambda v: v in {'fast', 'standard', 'balanced', 'exhaustive', 'basinhopping'})
 
         #
         # ['F Statistic']
@@ -380,7 +380,7 @@ def set_default_values(config):
         fit_params['weights'] = np.array(fit_params['weights'])
     fit_params['interpolation'] = bool(fit_params.get('interpolation', False))
     fit_params['type'] = str(fit_params.get('type', 'OLS'))  # can be: 'OLS', 'MLE',
-    fit_params['speed'] = str(fit_params.get('speed', 'standard'))  # can be: 'fast', 'standard', 'extensive', 'basinhopping'
+    fit_params['speed'] = str(fit_params.get('speed', 'standard'))  # can be: 'fast', 'standard', 'balanced', 'exhaustive', 'basinhopping'
     fit_params['max_iterations'] = int(fit_params.get('max_iterations', 100 * len(experiments)))  # optional int
     fit_params['control_fold_change'] = bool(fit_params.get('control_fold_change', False))  # to fix the fold change calculation to control 1
     config['Curve Fit'] = fit_params
