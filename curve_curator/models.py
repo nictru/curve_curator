@@ -19,6 +19,13 @@ NOISE_LIMITS = (1e-5, 20)  # Variance Range of the Normal error
 PEC50_DELTA = 2  # Delta +/- pEC50 around the doses to define the boundary
 SLOPE_LIMITS = (0.01, 10)  # Slope Range
 Y_LIMITS = (1e-4, 1e6)  # Y-axis Range
+BALANCED_MAX_GUESSES = 4  # Upper cap on optimized starts during escalation
+BALANCED_WEAK_SIGNAL_MAX_GUESSES = 11  # Upper cap for almost-flat dose responses
+BALANCED_COMPETITOR_RATIO = 1.02  # Cheap-start SSE ratio for basin ambiguity
+BALANCED_BOUND_EPS = 1e-3  # Relative tolerance for detecting boundary-pinned fits
+BALANCED_PRIMARY_GOOD_R2 = 0.99  # Early-exit threshold for the primary slope loop
+PEC50_DEDUP_DELTA = 0.25  # Skip starts whose pEC50 is near an already optimized start
+WEAK_SIGNAL_RESPONSE_RANGE = 0.05
 
 
 class _Model:
@@ -1266,6 +1273,15 @@ class LogisticModel(_Model):
                 best_guess, best_likelihood = guess, guess_likelihood
         return self.set_initial_guess(*best_guess)
 
+    def _rank_alternative_guesses_ols(self, x, y, noise=None, weights=None):
+        """Rank alternative starting guesses by cheap OLS cost."""
+        cost = self.cost_function_ols(x, y, weights=weights)
+        ranked_guesses = []
+        for guess in self.alternative_guesses(x, y, noise):
+            ranked_guesses.append((cost(guess[:-1]), guess))
+        ranked_guesses.sort(key=lambda item: item[0])
+        return ranked_guesses
+
     def find_best_guess_ols(self, x, y, noise=None, weights=None):
         """
         Find the best starting guess for OLS estimation among the alternative guesses given x and y data and some noise estimate.
@@ -1441,6 +1457,193 @@ class LogisticModel(_Model):
         # Save the best fit
         self.set_initial_guess(**best_fit['g_opt'])
         self.set_fitted_params(best_fit['p_opt'])
+
+    def _primary_fit_is_clean(self, x, y):
+        """Return True when the current fit looks stable after one slope seed."""
+        if self._fitted_param_at_bound():
+            return False
+        return float(self.calculate_r2(x, y)) >= BALANCED_PRIMARY_GOOD_R2
+
+    def _optimize_ols_guesses(
+        self,
+        x,
+        y,
+        guesses,
+        *,
+        slopes=None,
+        weights=None,
+        early_exit_on_clean=False,
+    ):
+        """Run OLS from heuristic starts and return the best solution without applying it."""
+        if slopes is None:
+            slopes = [SLOPE_LIMITS[0], 1.0, SLOPE_LIMITS[1]]
+        best_fit = {'cost': np.inf, 'p_opt': {}, 'g_opt': {}}
+        for guess in guesses:
+            self.set_initial_guess(*guess)
+            for slope in slopes:
+                self.guess['slope'] = slope
+                cost = self.fit_ols(x, y, weights=weights)
+                if cost < best_fit['cost']:
+                    best_fit = {
+                        'cost': cost,
+                        'p_opt': self.get_fitted_params().values(),
+                        'g_opt': dict(self.guess),
+                    }
+                    if early_exit_on_clean and self._primary_fit_is_clean(x, y):
+                        return best_fit
+                if self.params['slope'] is not None:
+                    break
+        return best_fit
+
+    def _apply_optimized_fit(self, best_fit):
+        """Persist one optimized fit on the model."""
+        self.set_initial_guess(**best_fit['g_opt'])
+        self.set_fitted_params(best_fit['p_opt'])
+
+    def _is_weak_signal_curve(self, y):
+        """Return True when drug-response variation is too small for a single cheap start."""
+        drug_y = np.asarray(y)[1:]
+        if drug_y.size == 0:
+            return False
+        return float(np.max(drug_y) - np.min(drug_y)) < WEAK_SIGNAL_RESPONSE_RANGE
+
+    def _fitted_param_at_bound(self):
+        """Return True when the optimized slope sits on its search boundary."""
+        params = self.get_fitted_params()
+        if 'slope' not in params or 'slope' not in self.bounds:
+            return False
+        value = float(params['slope'])
+        lower, upper = self.bounds['slope']
+        span = float(upper - lower)
+        tolerance = max(BALANCED_BOUND_EPS * span, BALANCED_BOUND_EPS)
+        return value <= lower + tolerance or value >= upper - tolerance
+
+    def _has_basin_ambiguity(self, ranked_guesses, primary_fit, *, competitor_ratio=BALANCED_COMPETITOR_RATIO):
+        """Return True when another cheap start explores a meaningfully different pEC50 basin."""
+        if len(ranked_guesses) < 2:
+            return False
+        best_sse = ranked_guesses[0][0]
+        primary_pec50 = float(primary_fit['g_opt']['pec50'])
+        for sse, guess in ranked_guesses[1:]:
+            if sse > best_sse * competitor_ratio:
+                return False
+            if abs(float(guess[0]) - primary_pec50) > PEC50_DEDUP_DELTA:
+                return True
+        return False
+
+    def _needs_escalation(self, y, ranked_guesses, primary_fit, *, competitor_ratio=BALANCED_COMPETITOR_RATIO):
+        """Decide whether the applied primary fit should trigger additional multi-start search."""
+        if self._is_weak_signal_curve(y):
+            return True
+        if self._fitted_param_at_bound():
+            return True
+        return self._has_basin_ambiguity(
+            ranked_guesses,
+            primary_fit,
+            competitor_ratio=competitor_ratio,
+        )
+
+    def _select_escalation_guesses(self, ranked_guesses, primary_fit, *, max_starts):
+        """Return deduplicated ranked starts to optimize after the primary fit."""
+        primary_pec50 = float(primary_fit['g_opt']['pec50'])
+        tried_pec50 = [primary_pec50]
+        selected = []
+        for _, guess in ranked_guesses[1:]:
+            if 1 + len(selected) >= max_starts:
+                break
+            guess_pec50 = float(guess[0])
+            if any(abs(guess_pec50 - pec50) <= PEC50_DEDUP_DELTA for pec50 in tried_pec50):
+                continue
+            selected.append(guess)
+            tried_pec50.append(guess_pec50)
+        return selected
+
+    def balanced_fit_ols(
+        self,
+        x,
+        y,
+        noise=None,
+        slopes=None,
+        weights=None,
+        max_guesses=BALANCED_MAX_GUESSES,
+        competitor_ratio=BALANCED_COMPETITOR_RATIO,
+    ):
+        """
+        Fit using OLS with lazy escalate-on-demand multi-start search.
+
+        The primary fit uses the best cheap start with up to three slope seeds,
+        exiting early when the fit is clean. Additional starts run only when the
+        primary fit is boundary-pinned, weak-signal, or faces competing cheap basins.
+
+        Parameters
+        ----------
+        x : array-like
+            Input array with drug concentrations in log10 space.
+        y : array-like
+            observes y-values.
+        noise : float, optional
+            expected noise of the curve.
+        slopes : list of floats, optional
+            The different slope values that should be tested during the primary fit.
+            By Default None, 3 different slopes are uses ([SLOPE_LIMITS[0], 1.0, SLOPE_LIMITS[1]]).
+        weights : array-like, optional
+            A weight for each (x,y)-pair. A bigger number corresponds to a higher importance. Default is None.
+        max_guesses : int, optional
+            Maximum number of optimized starts during escalation.
+        competitor_ratio : float, optional
+            Cheap-start SSE ratio for detecting basin ambiguity.
+        """
+        primary_slopes = (
+            [1.0, SLOPE_LIMITS[1], SLOPE_LIMITS[0]] if slopes is None else list(slopes)
+        )
+        ranked_guesses = self._rank_alternative_guesses_ols(x, y, noise=noise, weights=weights)
+        if not ranked_guesses:
+            return
+
+        primary_fit = self._optimize_ols_guesses(
+            x,
+            y,
+            [ranked_guesses[0][1]],
+            slopes=primary_slopes,
+            weights=weights,
+            early_exit_on_clean=True,
+        )
+        self._apply_optimized_fit(primary_fit)
+        if not self._needs_escalation(
+            y,
+            ranked_guesses,
+            primary_fit,
+            competitor_ratio=competitor_ratio,
+        ):
+            return
+
+        max_starts = (
+            BALANCED_WEAK_SIGNAL_MAX_GUESSES
+            if self._is_weak_signal_curve(y)
+            else max_guesses
+        )
+        escalation_guesses = self._select_escalation_guesses(
+            ranked_guesses,
+            primary_fit,
+            max_starts=max_starts,
+        )
+        if self._fitted_param_at_bound():
+            secondary_slopes = list(primary_slopes)
+        else:
+            secondary_slopes = [float(primary_fit['g_opt']['slope'])]
+        best_fit = primary_fit
+        if escalation_guesses:
+            escalated_fit = self._optimize_ols_guesses(
+                x,
+                y,
+                escalation_guesses,
+                slopes=secondary_slopes,
+                weights=weights,
+            )
+            if escalated_fit['cost'] < best_fit['cost']:
+                best_fit = escalated_fit
+
+        self._apply_optimized_fit(best_fit)
 
     def estimate_noise(self, x, y, params=None):
         """

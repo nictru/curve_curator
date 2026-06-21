@@ -307,6 +307,8 @@ def fit_model(y_data, x_data, M0, M1, fit_params, f_statistic_params):
             M1.fit_ols(x_fit, y_fit, weights=weights)
         elif fit_params['speed'] == 'standard':
             M1.efficiently_fit_ols(x_fit, y_fit, noise=M0.noise, weights=weights)
+        elif fit_params['speed'] == 'balanced':
+            M1.balanced_fit_ols(x_fit, y_fit, noise=M0.noise, weights=weights)
         elif fit_params['speed'] == 'exhaustive':
             M1.extensively_fit_guesses_ols(x_fit, y_fit, noise=M0.noise)
         elif fit_params['speed'] == 'basinhopping':

@@ -544,6 +544,32 @@ class TestFitting:
         LM.efficiently_fit_ols(self.x, self.y, self.noise)
         pd.testing.assert_series_equal(pd.Series(LM.get_fitted_params()), pd.Series(self.params), atol=1e-4)
 
+    def test_balanced_ols_fitting(self):
+        LM = LogisticModel()
+        LM.set_boundaries(self.x)
+        LM.balanced_fit_ols(self.x, self.y, self.noise)
+        pd.testing.assert_series_equal(pd.Series(LM.get_fitted_params()), pd.Series(self.params), atol=1e-4)
+
+    def test_balanced_ols_recovers_second_guess_curve(self):
+        x = np.linspace(-10, -5, 20)
+        params = {'pec50': 7.0, 'slope': 6.0, 'front': 1.0, 'back': 0.1}
+        y = LogisticModel.core(x, **params)
+        standard = LogisticModel()
+        standard.set_boundaries(x)
+        standard.efficiently_fit_ols(x, y, self.noise)
+        balanced = LogisticModel()
+        balanced.set_boundaries(x)
+        balanced.balanced_fit_ols(x, y, self.noise)
+        exhaustive = LogisticModel()
+        exhaustive.set_boundaries(x)
+        exhaustive.extensively_fit_guesses_ols(x, y, self.noise)
+        assert balanced.calculate_rmse(x, y) <= standard.calculate_rmse(x, y) + 1e-6
+        pd.testing.assert_series_equal(
+            pd.Series(balanced.get_fitted_params()),
+            pd.Series(exhaustive.get_fitted_params()),
+            atol=1e-3,
+        )
+
     def test_simple_mle_fitting(self):
         LM = LogisticModel()
         LM.set_boundaries(self.x)
