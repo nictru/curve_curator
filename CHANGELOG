@@ -1,5 +1,6 @@
 v0.7.0
 - Add `balanced` OLS curve-fit speed mode with lazy escalate-on-demand multi-start search, offering a faster alternative to exhaustive fitting while preserving fit quality on most curves
+- Relax Poetry dependency version ranges and add Python 3.14 support
 
 v0.6.0
 - Improve the dashboard (#30, #32, #36, #41)
