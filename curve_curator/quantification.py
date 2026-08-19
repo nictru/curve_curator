@@ -534,6 +534,8 @@ def run_pipeline(df, config, decoy_mode=False):
     n_cores = config['Processing']['available_cores']
     data_type = 'decoy' if decoy_mode else 'curves'
     ui.message(f" * Fitting {data_type} parameters by {fit_params['speed']} {fit_params['type']} with {n_cores} cores:")
+    # Consolidate fragmented blocks from bulk column insertions above before the expensive parallelized fitting
+    df = df.copy()
     df = tool.parallelize_dataframe(df, n_cores, add_logistic_model, ratio_cols=cols_ratio_sorted, x_data=drug_log_concs_sorted,
                                     f_statistic_params=f_statistic_params, fit_params=fit_params)
     ui.message(f' * Fitting {data_type} parameters done !')

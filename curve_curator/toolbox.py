@@ -37,11 +37,11 @@ def parallelize_dataframe(df, n_cores, func, **kwargs):
     df : pd.DataFrame
         Processed DataFrame as the function would have done it
     """
+    if n_cores <= 1:
+        return func(df, **kwargs)
     with multiprocessing.Pool(processes=n_cores) as pool:
-        df_splited = np.array_split(df, n_cores)
-        df_processed = pool.map(functools.partial(func, **kwargs), df_splited)
-        df = pd.concat(df_processed)
-        pool.terminate()
+        df_split = np.array_split(df, n_cores)
+        df = pd.concat(pool.map(functools.partial(func, **kwargs), df_split))
     return df
 
 
